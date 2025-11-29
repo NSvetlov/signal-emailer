@@ -4,6 +4,8 @@ import smtplib
 from datetime import datetime
 from typing import List, Dict
 import time
+import json
+import hashlib
 
 import numpy as np
 import pandas as pd
@@ -171,21 +173,69 @@ def main() -> int:
 
     # Only send when there are alerts by default; override with ALWAYS_SEND=1
     always_send = (_get_env("ALWAYS_SEND", "0") == "1")
-    if total_alerts > 0 or always_send:
+
+    # Duplicate suppression: avoid sending identical content too frequently
+    disable_dedup = (_get_env("DISABLE_DEDUP", "0") == "1")
+    min_interval_s = int(_get_env("MIN_SEND_INTERVAL_SECONDS", "86400") or "86400")
+    state_path = _get_env(
+        "STATE_FILE",
+        os.path.join(os.path.dirname(__file__), ".signal_emailer_state.json"),
+    )
+
+    def _load_state(path: str) -> dict:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def _save_state(path: str, state: dict) -> None:
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(state, f)
+        except Exception:
+            pass
+
+    content_hash = hashlib.sha256((subject + "\n" + body).encode("utf-8")).hexdigest()
+    now_ts = int(time.time())
+    state = _load_state(state_path)
+    last_hash = state.get("last_hash")
+    last_sent = int(state.get("last_sent", 0))
+
+    should_send_now = (total_alerts > 0 or always_send)
+    if should_send_now and not disable_dedup:
+        if last_hash == content_hash and (now_ts - last_sent) < min_interval_s:
+            should_send_now = False
+            remaining = max(0, min_interval_s - (now_ts - last_sent))
+            print(
+                f"Skipping duplicate email (next allowed in ~{remaining} sec)."
+            )
+
+    if should_send_now:
         send_email(subject, body)
         print(f"Email sent: {subject}")
+        # update state
+        state.update({"last_hash": content_hash, "last_sent": now_ts})
+        _save_state(state_path, state)
     else:
-        print("No alerts; not sending email (set ALWAYS_SEND=1 to force).")
+        if total_alerts == 0 and not always_send:
+            print("No alerts; not sending email (set ALWAYS_SEND=1 to force).")
 
     return 0
 
 
 if __name__ == "__main__":
-    interval_s = int(_get_env("CHECK_INTERVAL_SECONDS", "60") or "60")
+    # Looping is now opt-in: provide CHECK_INTERVAL_SECONDS>0 to enable.
+    interval_raw = _get_env("CHECK_INTERVAL_SECONDS", None)
+    interval_s = int(interval_raw) if interval_raw not in (None, "", "0") else 0
     try:
-        while True:
+        if interval_s > 0:
+            while True:
+                main()
+                # Avoid spamming if ALWAYS_SEND=1; dedup also protects identical content
+                time.sleep(max(5, interval_s))
+        else:
+            # Single run (recommended to use OS scheduler for cadence)
             main()
-            # Avoid spamming if ALWAYS_SEND=1; recommend leaving it 0 for loops
-            time.sleep(max(5, interval_s))
     except KeyboardInterrupt:
         pass
