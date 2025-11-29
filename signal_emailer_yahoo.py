@@ -1,0 +1,190 @@
+import os
+import ssl
+import smtplib
+from datetime import datetime
+from typing import List, Dict
+import time
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+# Default tickers: Micro equity futures
+DEFAULT_TICKERS = "MNQ=F,MES=F,MYM=F,M2K=F"
+
+
+def _get_env(name: str, default: str | None = None, required: bool = False) -> str | None:
+    val = os.environ.get(name, default)
+    if required and (val is None or (isinstance(val, str) and val.strip() == "")):
+        raise SystemExit(f"Missing required environment variable: {name}")
+    if isinstance(val, str):
+        return val.strip()
+    return val
+
+
+def send_email(subject: str, body: str) -> None:
+    server = _get_env("SMTP_SERVER", "smtp.gmail.com")
+    port = int(_get_env("SMTP_PORT", "465"))
+    username = _get_env("SMTP_USERNAME", required=True)
+    password = _get_env("SMTP_PASSWORD", required=True)
+    sender = _get_env("EMAIL_FROM", username)
+    to_csv = _get_env("EMAIL_TO", required=True)
+    recipients = [x.strip() for x in to_csv.split(",") if x.strip()]
+
+    msg = (
+        f"From: {sender}\r\n"
+        f"To: {', '.join(recipients)}\r\n"
+        f"Subject: {subject}\r\n"
+        "\r\n"
+        f"{body}"
+    )
+
+    if port == 465:
+        context = ssl.create_default_context()
+        with smtplib.SMTP_SSL(server, port, context=context) as smtp:
+            smtp.login(username, password)
+            smtp.sendmail(sender, recipients, msg.encode("utf-8"))
+    else:
+        with smtplib.SMTP(server, port) as smtp:
+            smtp.ehlo()
+            if port == 587:
+                smtp.starttls(context=ssl.create_default_context())
+                smtp.ehlo()
+            if username and password:
+                smtp.login(username, password)
+            smtp.sendmail(sender, recipients, msg.encode("utf-8"))
+
+
+def _rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(window=period, min_periods=period).mean()
+    avg_loss = loss.rolling(window=period, min_periods=period).mean()
+    rs = avg_gain / (avg_loss.replace(0, np.nan))
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.fillna(50)
+
+
+def fetch_daily(ticker: str, lookback_days: int = 120) -> pd.DataFrame:
+    df = yf.download(
+        ticker,
+        period=f"{lookback_days}d",
+        interval="1d",
+        auto_adjust=True,
+        progress=False,
+        group_by="column",
+    )
+    if df.empty:
+        raise RuntimeError(f"No data for {ticker}")
+
+    # Handle possible MultiIndex columns returned by yfinance
+    if isinstance(df.columns, pd.MultiIndex):
+        cols0 = df.columns.get_level_values(0)
+        cols1 = df.columns.get_level_values(1)
+        if "Close" in cols0 or "close" in cols0.str.lower():
+            df = df.droplevel(1, axis=1)
+        elif "Close" in cols1 or "close" in cols1.str.lower():
+            df = df.droplevel(0, axis=1)
+        else:
+            df.columns = [str(c[0]) for c in df.columns]
+
+    # Find canonical column names regardless of exact case
+    def _find_col(name: str) -> str:
+        lname = name.lower()
+        for c in df.columns:
+            if str(c).strip().lower() == lname:
+                return c
+        raise RuntimeError(f"Missing column '{name}' in downloaded data")
+
+    close_col = _find_col("Close")
+    high_col = _find_col("High")
+    low_col = _find_col("Low")
+
+    df["SMA20"] = df[close_col].rolling(20).mean()
+    df["SMA50"] = df[close_col].rolling(50).mean()
+    df["RSI14"] = _rsi(df[close_col], 14)
+    df["HH20"] = df[high_col].rolling(20).max()
+    df["LL20"] = df[low_col].rolling(20).min()
+    return df.dropna().copy()
+
+
+def detect_signals(df: pd.DataFrame) -> List[str]:
+    if len(df) < 3:
+        return []
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    signals: List[str] = []
+
+    if last.SMA20 > last.SMA50 and prev.SMA20 <= prev.SMA50:
+        signals.append("Bullish 20/50 SMA cross")
+    if last.SMA20 < last.SMA50 and prev.SMA20 >= prev.SMA50:
+        signals.append("Bearish 20/50 SMA cross")
+
+    if last.RSI14 > 70 and prev.RSI14 <= 70:
+        signals.append("RSI > 70 (overbought)")
+    if last.RSI14 < 30 and prev.RSI14 >= 30:
+        signals.append("RSI < 30 (oversold)")
+
+    if last.Close > prev.HH20 and prev.Close <= prev.HH20:
+        signals.append("20-day breakout up")
+    if last.Close < prev.LL20 and prev.Close >= prev.LL20:
+        signals.append("20-day breakdown down")
+
+    return signals
+
+
+def build_report(tickers: List[str]) -> Dict[str, List[str]]:
+    results: Dict[str, List[str]] = {}
+    for t in tickers:
+        try:
+            df = fetch_daily(t)
+            sigs = detect_signals(df)
+            if sigs:
+                results[t] = sigs
+        except Exception as e:
+            # Include errors as notes so you notice issues
+            results[t] = [f"Error: {e}"]
+    return results
+
+
+def main() -> int:
+    tickers_csv = _get_env("YF_TICKERS", DEFAULT_TICKERS) or DEFAULT_TICKERS
+    tickers = [t.strip() for t in tickers_csv.split(",") if t.strip()]
+
+    findings = build_report(tickers)
+
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    total_alerts = sum(len(v) for v in findings.values() if v)
+    subject = f"Signals: {len(tickers)} tickers, {total_alerts} alerts ({date_str})"
+
+    lines: List[str] = []
+    for t in tickers:
+        if t in findings and findings[t]:
+            for s in findings[t]:
+                lines.append(f"- {t}: {s}")
+    if not lines:
+        lines.append("No signals today.")
+
+    body = "\n".join(lines)
+
+    always_send = (_get_env("ALWAYS_SEND", "0") == "1")
+    if total_alerts > 0 or always_send:
+        send_email(subject, body)
+        print(f"Email sent: {subject}")
+    else:
+        print("No alerts; not sending email (set ALWAYS_SEND=1 to force).")
+
+    return 0
+
+
+if __name__ == "__main__":
+    interval_s = int(_get_env("CHECK_INTERVAL_SECONDS", "60") or "60")
+    try:
+        while True:
+            main()
+            # Avoid spamming if ALWAYS_SEND=1; recommend leaving it 0 for loops
+            time.sleep(max(5, interval_s))
+    except KeyboardInterrupt:
+        pass
