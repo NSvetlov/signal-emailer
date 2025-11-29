@@ -158,21 +158,46 @@ def main() -> int:
     findings = build_report(tickers)
 
     date_str = datetime.now().strftime("%Y-%m-%d")
-    total_alerts = sum(len(v) for v in findings.values() if v)
+    # Separate real signals from error notes so errors don't count as alerts
+    signals_by_ticker: Dict[str, List[str]] = {}
+    errors_by_ticker: Dict[str, List[str]] = {}
+    for t, items in findings.items():
+        if not items:
+            continue
+        sigs = [x for x in items if not isinstance(x, str) or not x.startswith("Error:")]
+        errs = [x for x in items if isinstance(x, str) and x.startswith("Error:")]
+        if sigs:
+            signals_by_ticker[t] = sigs
+        if errs:
+            errors_by_ticker[t] = errs
+
+    total_alerts = sum(len(v) for v in signals_by_ticker.values())
     subject = f"Signals: {len(tickers)} tickers, {total_alerts} alerts ({date_str})"
 
     lines: List[str] = []
     for t in tickers:
-        if t in findings and findings[t]:
-            for s in findings[t]:
+        if t in signals_by_ticker:
+            for s in signals_by_ticker[t]:
                 lines.append(f"- {t}: {s}")
     if not lines:
         lines.append("No signals today.")
+
+    # Optionally include error notes at the end of the email body (informational)
+    include_errors = (_get_env("INCLUDE_ERRORS_IN_BODY", "1") == "1")
+    if include_errors and errors_by_ticker:
+        lines.append("")
+        lines.append("Notes (not counted as alerts):")
+        for t in tickers:
+            if t in errors_by_ticker:
+                for e in errors_by_ticker[t]:
+                    lines.append(f"- {t}: {e}")
 
     body = "\n".join(lines)
 
     # Only send when there are alerts by default; override with ALWAYS_SEND=1
     always_send = (_get_env("ALWAYS_SEND", "0") == "1")
+    # Allow sending if there are only errors (no signals) when SEND_ON_ERROR=1
+    send_on_error = (_get_env("SEND_ON_ERROR", "0") == "1")
 
     # Duplicate suppression: avoid sending identical content too frequently
     disable_dedup = (_get_env("DISABLE_DEDUP", "0") == "1")
@@ -202,7 +227,8 @@ def main() -> int:
     last_hash = state.get("last_hash")
     last_sent = int(state.get("last_sent", 0))
 
-    should_send_now = (total_alerts > 0 or always_send)
+    has_errors_only = (total_alerts == 0 and len(errors_by_ticker) > 0)
+    should_send_now = (total_alerts > 0 or always_send or (send_on_error and has_errors_only))
     if should_send_now and not disable_dedup:
         if last_hash == content_hash and (now_ts - last_sent) < min_interval_s:
             should_send_now = False
@@ -218,8 +244,8 @@ def main() -> int:
         state.update({"last_hash": content_hash, "last_sent": now_ts})
         _save_state(state_path, state)
     else:
-        if total_alerts == 0 and not always_send:
-            print("No alerts; not sending email (set ALWAYS_SEND=1 to force).")
+        if total_alerts == 0 and not always_send and not (send_on_error and has_errors_only):
+            print("No alerts; not sending email (set ALWAYS_SEND=1 or SEND_ON_ERROR=1 to force).")
 
     return 0
 
