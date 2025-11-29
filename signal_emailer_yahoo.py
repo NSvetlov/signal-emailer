@@ -169,6 +169,7 @@ def main() -> int:
 
     body = "\n".join(lines)
 
+    # Only send when there are alerts by default; override with ALWAYS_SEND=1
     always_send = (_get_env("ALWAYS_SEND", "0") == "1")
     if total_alerts > 0 or always_send:
         send_email(subject, body)
