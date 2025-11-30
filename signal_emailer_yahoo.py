@@ -14,6 +14,18 @@ import yfinance as yf
 # Default tickers: Micro equity futures
 DEFAULT_TICKERS = "MNQ=F,MES=F,MYM=F,M2K=F"
 
+# Default strategy params
+DEFAULT_BASE_INTERVAL = os.environ.get("BASE_INTERVAL", "1m").strip() or "1m"
+DEFAULT_CONTEXT_INTERVAL = os.environ.get("CONTEXT_INTERVAL", "60m").strip() or "60m"
+DONCHIAN_N = int(os.environ.get("DONCHIAN_N", "20") or "20")
+EMA_N = int(os.environ.get("EMA_N", "50") or "50")
+ATR_N = int(os.environ.get("ATR_N", "14") or "14")
+
+# Sizing params (informational only; no trade placement)
+RISK_PER_TRADE = float(os.environ.get("RISK_PER_TRADE", "100"))
+MIN_QTY = int(os.environ.get("MIN_QTY", "1"))
+MAX_CONTRACTS = int(os.environ.get("MAX_CONTRACTS", "2"))
+
 
 def _get_env(name: str, default: str | None = None, required: bool = False) -> str | None:
     val = os.environ.get(name, default)
@@ -83,6 +95,24 @@ def _rsi(series: pd.Series, period: int = 14) -> pd.Series:
     return rsi.fillna(50)
 
 
+def _ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
+
+
+def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    # expects columns High, Low, Close (case-insensitive handled before)
+    high = df["High"]
+    low = df["Low"]
+    close = df["Close"]
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        (high - low),
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return tr.rolling(period, min_periods=period).mean()
+
+
 def _resolve_period_for_interval(interval: str, lookback_days: int = 120) -> str:
     # Allow global override
     global_override = _get_env("YF_PERIOD", None)
@@ -141,53 +171,163 @@ def fetch_bars(ticker: str, interval: str, lookback_days: int = 120) -> pd.DataF
     high_col = _find_col("High")
     low_col = _find_col("Low")
 
-    df["SMA20"] = df[close_col].rolling(20).mean()
-    df["SMA50"] = df[close_col].rolling(50).mean()
-    df["RSI14"] = _rsi(df[close_col], 14)
-    df["HH20"] = df[high_col].rolling(20).max()
-    df["LL20"] = df[low_col].rolling(20).min()
-    return df.dropna().copy()
+    # Normalize canonical caps used later
+    if close_col != "Close":
+        df = df.rename(columns={close_col: "Close"})
+    if high_col != "High":
+        df = df.rename(columns={high_col: "High"})
+    if low_col != "Low":
+        df = df.rename(columns={low_col: "Low"})
+
+    return df.copy()
 
 
-def detect_signals(df: pd.DataFrame) -> List[str]:
-    if len(df) < 3:
-        return []
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-
-    signals: List[str] = []
-
-    if last.SMA20 > last.SMA50 and prev.SMA20 <= prev.SMA50:
-        signals.append("Bullish 20/50 SMA cross")
-    if last.SMA20 < last.SMA50 and prev.SMA20 >= prev.SMA50:
-        signals.append("Bearish 20/50 SMA cross")
-
-    if last.RSI14 > 70 and prev.RSI14 <= 70:
-        signals.append("RSI > 70 (overbought)")
-    if last.RSI14 < 30 and prev.RSI14 >= 30:
-        signals.append("RSI < 30 (oversold)")
-
-    if last.Close > prev.HH20 and prev.Close <= prev.HH20:
-        signals.append("20-day breakout up")
-    if last.Close < prev.LL20 and prev.Close >= prev.LL20:
-        signals.append("20-day breakdown down")
-
-    return signals
+def _point_value_for_ticker(ticker: str) -> float:
+    # Allow overrides per ticker
+    key = f"POINT_VALUE_{ticker.replace('=','_').replace('-','_').upper()}"
+    ov = os.environ.get(key)
+    if ov:
+        try:
+            return float(ov)
+        except Exception:
+            pass
+    gen = os.environ.get("POINT_VALUE")
+    if gen:
+        try:
+            return float(gen)
+        except Exception:
+            pass
+    mapping = {
+        "MNQ=F": 2.0,
+        "MES=F": 5.0,
+        "MYM=F": 0.5,
+        "M2K=F": 5.0,
+    }
+    return mapping.get(ticker.upper(), 1.0)
 
 
-def build_report(tickers: List[str], intervals: List[str]) -> Dict[str, List[str]]:
+def _clamp(v: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, v))
+
+
+def _sizing(atr_points: float, point_value: float) -> int:
+    if atr_points <= 0 or point_value <= 0:
+        return 0
+    qty = int(np.floor(RISK_PER_TRADE / (2.0 * atr_points * point_value)))
+    return _clamp(qty, MIN_QTY, MAX_CONTRACTS) if qty > 0 else 0
+
+
+def _donchian(df: pd.DataFrame, n: int) -> tuple[pd.Series, pd.Series]:
+    hh = df["High"].rolling(n).max()
+    ll = df["Low"].rolling(n).min()
+    return hh, ll
+
+
+def _add_context_and_indicators(df_1m: pd.DataFrame, df_60m: pd.DataFrame) -> dict:
+    # Compute hourly EMA and slope, hourly ATR as context
+    ema50_h = _ema(df_60m["Close"], EMA_N)
+    ema50_slope_h = ema50_h - ema50_h.shift(1)
+    atr_h = _atr(df_60m, ATR_N)
+    context = {
+        "ema50_h": ema50_h,
+        "ema50_slope_h": ema50_slope_h,
+        "atr_h": atr_h,
+    }
+    # 1m indicators
+    atr_1m = _atr(df_1m, ATR_N)
+    hh20, ll20 = _donchian(df_1m, DONCHIAN_N)
+    ind = {
+        "atr_1m": atr_1m,
+        "hh": hh20,
+        "ll": ll20,
+    }
+    return {**context, **ind}
+
+
+def _get_hourly_context_at(df_60m: pd.DataFrame, ema50_h: pd.Series, ema50_slope_h: pd.Series, atr_h: pd.Series, ts: pd.Timestamp) -> tuple[float, float, float]:
+    # Align 1m ts to last available hourly bar at or before ts
+    idx = df_60m.index.get_indexer([ts], method="pad")
+    pos = idx[0] if len(idx) else -1
+    if pos < 0:
+        return np.nan, np.nan, np.nan
+    return float(ema50_h.iloc[pos]), float(ema50_slope_h.iloc[pos]), float(atr_h.iloc[pos])
+
+
+def _build_entry_signal(ticker: str, df_1m: pd.DataFrame, df_60m: pd.DataFrame) -> dict | None:
+    if len(df_1m) < max(DONCHIAN_N + 1, ATR_N + 1) or len(df_60m) < max(EMA_N + 1, ATR_N + 1):
+        return None
+    inds = _add_context_and_indicators(df_1m, df_60m)
+    last = df_1m.iloc[-1]
+    prev = df_1m.iloc[-2]
+    ts = df_1m.index[-1]
+
+    ema50_h, ema50_slope, atr_h = _get_hourly_context_at(
+        df_60m, inds["ema50_h"], inds["ema50_slope_h"], inds["atr_h"], ts
+    )
+    if np.isnan(ema50_h) or np.isnan(ema50_slope):
+        return None
+
+    hh_prev = inds["hh"].iloc[-2]
+    ll_prev = inds["ll"].iloc[-2]
+    atr_1m = float(inds["atr_1m"].iloc[-1])
+    pv = _point_value_for_ticker(ticker)
+    qty = _sizing(atr_1m, pv)
+    if qty <= 0:
+        return None
+
+    long_ok = (last["Close"] > hh_prev) and (last["Close"] > ema50_h) and (ema50_slope > 0)
+    short_ok = (last["Close"] < ll_prev) and (last["Close"] < ema50_h) and (ema50_slope < 0)
+
+    if long_ok:
+        return {
+            "dir": "long",
+            "entry": float(last["Close"]),
+            "atr": atr_1m,
+            "qty": qty,
+            "pv": pv,
+            "ts": ts,
+            "ema50_h": float(ema50_h),
+            "ema_slope": float(ema50_slope),
+            "atr_h": float(atr_h) if not np.isnan(atr_h) else None,
+        }
+    if short_ok:
+        return {
+            "dir": "short",
+            "entry": float(last["Close"]),
+            "atr": atr_1m,
+            "qty": qty,
+            "pv": pv,
+            "ts": ts,
+            "ema50_h": float(ema50_h),
+            "ema_slope": float(ema50_slope),
+            "atr_h": float(atr_h) if not np.isnan(atr_h) else None,
+        }
+    return None
+
+
+    
+
+
+def build_report(tickers: List[str]) -> Dict[str, List[str]]:
     results: Dict[str, List[str]] = {}
     for t in tickers:
         bucket: List[str] = []
-        for iv in intervals:
-            try:
-                df = fetch_bars(t, iv)
-                sigs = detect_signals(df)
-                if sigs:
-                    for s in sigs:
-                        bucket.append(f"[{iv}] {s}")
-            except Exception as e:
-                bucket.append(f"[{iv}] Error: {e}")
+        try:
+            df1 = fetch_bars(t, DEFAULT_BASE_INTERVAL)
+            df60 = fetch_bars(t, DEFAULT_CONTEXT_INTERVAL, lookback_days=400)
+            atr_1m = _atr(df1, ATR_N)
+            hh, ll = _donchian(df1, DONCHIAN_N)
+            df1 = df1.assign(ATR1m=atr_1m, HH=hh, LL=ll).dropna()
+            if len(df1) == 0:
+                continue
+            sig = _build_entry_signal(t, df1, df60)
+            if sig:
+                stop = sig["entry"] - 2 * sig["atr"] if sig["dir"] == "long" else sig["entry"] + 2 * sig["atr"]
+                bucket.append(
+                    f"[{DEFAULT_BASE_INTERVAL}] entry {sig['dir']} @ {sig['entry']:.2f} | ATR={sig['atr']:.2f} stop={stop:.2f} qty={sig['qty']} (EMA50h={sig['ema50_h']:.2f} slope={sig['ema_slope']:+.2f})"
+                )
+        except Exception as e:
+            bucket.append(f"[{DEFAULT_BASE_INTERVAL}] Error: {e}")
         if bucket:
             results[t] = bucket
     return results
@@ -197,14 +337,7 @@ def main() -> int:
     tickers_csv = _get_env("YF_TICKERS", DEFAULT_TICKERS) or DEFAULT_TICKERS
     tickers = [t.strip() for t in tickers_csv.split(",") if t.strip()]
 
-    # Multi-interval support: YF_INTERVALS takes precedence; fallback to YF_INTERVAL; default 1d
-    intervals_raw = _get_env("YF_INTERVALS", None)
-    if intervals_raw and intervals_raw.strip():
-        intervals = [x.strip() for x in intervals_raw.split(",") if x.strip()]
-    else:
-        intervals = [(_get_env("YF_INTERVAL", "1d") or "1d").strip()]
-
-    findings = build_report(tickers, intervals)
+    findings = build_report(tickers)
 
     date_str = datetime.now().strftime("%Y-%m-%d")
     # Separate real signals from error notes so errors don't count as alerts
@@ -247,11 +380,10 @@ def main() -> int:
     hb = (_get_env("HEARTBEAT", "1") == "1")
     if hb:
         errors_count = sum(len(v) for v in errors_by_ticker.values())
-        intervals_str = ",".join(intervals)
         _log(
             f"[HEARTBEAT] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} "
             f"tickers={len(tickers)} alerts={total_alerts} errors={errors_count} "
-            f"yf_interval={intervals_str}"
+            f"base_interval={DEFAULT_BASE_INTERVAL} ctx_interval={DEFAULT_CONTEXT_INTERVAL}"
         )
 
     # Only send when there are alerts by default; override with ALWAYS_SEND=1
