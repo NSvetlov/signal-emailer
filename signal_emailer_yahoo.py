@@ -69,10 +69,19 @@ def _rsi(series: pd.Series, period: int = 14) -> pd.Series:
 
 
 def fetch_daily(ticker: str, lookback_days: int = 120) -> pd.DataFrame:
+    # Intraday support via env vars. Defaults remain daily bars.
+    yf_interval = _get_env("YF_INTERVAL", "1d") or "1d"
+    yf_period_env = _get_env("YF_PERIOD", None)
+    if yf_period_env and yf_period_env.strip():
+        yf_period = yf_period_env
+    else:
+        # Reasonable defaults: for daily use lookback_days; for intraday use 7d to satisfy Yahoo limits
+        yf_period = f"{lookback_days}d" if yf_interval == "1d" else "7d"
+
     df = yf.download(
         ticker,
-        period=f"{lookback_days}d",
-        interval="1d",
+        period=yf_period,
+        interval=yf_interval,
         auto_adjust=True,
         progress=False,
         group_by="column",
@@ -265,9 +274,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    # Looping is now opt-in: provide CHECK_INTERVAL_SECONDS>0 to enable.
-    interval_raw = _get_env("CHECK_INTERVAL_SECONDS", None)
-    interval_s = int(interval_raw) if interval_raw not in (None, "", "0") else 0
+    # Looping default: check every 60s unless disabled with CHECK_INTERVAL_SECONDS=0
+    interval_s = int(_get_env("CHECK_INTERVAL_SECONDS", "60") or "60")
     try:
         if interval_s > 0:
             while True:
@@ -275,7 +283,7 @@ if __name__ == "__main__":
                 # Avoid spamming if ALWAYS_SEND=1; dedup also protects identical content
                 time.sleep(max(5, interval_s))
         else:
-            # Single run (recommended to use OS scheduler for cadence)
+            # Single run (use OS scheduler for cadence)
             main()
     except KeyboardInterrupt:
         pass
