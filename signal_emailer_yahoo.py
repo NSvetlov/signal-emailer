@@ -83,15 +83,29 @@ def _rsi(series: pd.Series, period: int = 14) -> pd.Series:
     return rsi.fillna(50)
 
 
-def fetch_daily(ticker: str, lookback_days: int = 120) -> pd.DataFrame:
-    # Intraday support via env vars. Defaults remain daily bars.
-    yf_interval = _get_env("YF_INTERVAL", "1d") or "1d"
-    yf_period_env = _get_env("YF_PERIOD", None)
-    if yf_period_env and yf_period_env.strip():
-        yf_period = yf_period_env
-    else:
-        # Reasonable defaults: for daily use lookback_days; for intraday use 7d to satisfy Yahoo limits
-        yf_period = f"{lookback_days}d" if yf_interval == "1d" else "7d"
+def _resolve_period_for_interval(interval: str, lookback_days: int = 120) -> str:
+    # Allow global override
+    global_override = _get_env("YF_PERIOD", None)
+    # Allow per-interval override: YF_PERIOD_5M, YF_PERIOD_1H, etc.
+    key = f"YF_PERIOD_{interval.upper().replace('/', '_')}"
+    per_override = _get_env(key, None)
+    if per_override and per_override.strip():
+        return per_override
+    if global_override and global_override.strip():
+        return global_override
+    # Sensible defaults
+    if interval.endswith("m"):
+        # Intraday minutes: Yahoo restricts 1m to ~7d; others are also limited
+        return "7d"
+    if interval.endswith("h") or interval in ("60m", "90m", "1h"):
+        return "60d"
+    # Daily or higher
+    return f"{lookback_days}d"
+
+
+def fetch_bars(ticker: str, interval: str, lookback_days: int = 120) -> pd.DataFrame:
+    yf_interval = interval
+    yf_period = _resolve_period_for_interval(yf_interval, lookback_days)
 
     df = yf.download(
         ticker,
@@ -161,17 +175,21 @@ def detect_signals(df: pd.DataFrame) -> List[str]:
     return signals
 
 
-def build_report(tickers: List[str]) -> Dict[str, List[str]]:
+def build_report(tickers: List[str], intervals: List[str]) -> Dict[str, List[str]]:
     results: Dict[str, List[str]] = {}
     for t in tickers:
-        try:
-            df = fetch_daily(t)
-            sigs = detect_signals(df)
-            if sigs:
-                results[t] = sigs
-        except Exception as e:
-            # Include errors as notes so you notice issues
-            results[t] = [f"Error: {e}"]
+        bucket: List[str] = []
+        for iv in intervals:
+            try:
+                df = fetch_bars(t, iv)
+                sigs = detect_signals(df)
+                if sigs:
+                    for s in sigs:
+                        bucket.append(f"[{iv}] {s}")
+            except Exception as e:
+                bucket.append(f"[{iv}] Error: {e}")
+        if bucket:
+            results[t] = bucket
     return results
 
 
@@ -179,7 +197,14 @@ def main() -> int:
     tickers_csv = _get_env("YF_TICKERS", DEFAULT_TICKERS) or DEFAULT_TICKERS
     tickers = [t.strip() for t in tickers_csv.split(",") if t.strip()]
 
-    findings = build_report(tickers)
+    # Multi-interval support: YF_INTERVALS takes precedence; fallback to YF_INTERVAL; default 1d
+    intervals_raw = _get_env("YF_INTERVALS", None)
+    if intervals_raw and intervals_raw.strip():
+        intervals = [x.strip() for x in intervals_raw.split(",") if x.strip()]
+    else:
+        intervals = [(_get_env("YF_INTERVAL", "1d") or "1d").strip()]
+
+    findings = build_report(tickers, intervals)
 
     date_str = datetime.now().strftime("%Y-%m-%d")
     # Separate real signals from error notes so errors don't count as alerts
@@ -222,10 +247,11 @@ def main() -> int:
     hb = (_get_env("HEARTBEAT", "1") == "1")
     if hb:
         errors_count = sum(len(v) for v in errors_by_ticker.values())
+        intervals_str = ",".join(intervals)
         _log(
             f"[HEARTBEAT] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} "
             f"tickers={len(tickers)} alerts={total_alerts} errors={errors_count} "
-            f"yf_interval={_get_env('YF_INTERVAL', '1d') or '1d'}"
+            f"yf_interval={intervals_str}"
         )
 
     # Only send when there are alerts by default; override with ALWAYS_SEND=1
