@@ -203,6 +203,16 @@ def main() -> int:
 
     body = "\n".join(lines)
 
+    # Heartbeat: always print a summary each check so you know it's alive
+    hb = (_get_env("HEARTBEAT", "1") == "1")
+    if hb:
+        errors_count = sum(len(v) for v in errors_by_ticker.values())
+        print(
+            f"[HEARTBEAT] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} "
+            f"tickers={len(tickers)} alerts={total_alerts} errors={errors_count} "
+            f"yf_interval={_get_env('YF_INTERVAL', '1d') or '1d'}"
+        )
+
     # Only send when there are alerts by default; override with ALWAYS_SEND=1
     always_send = (_get_env("ALWAYS_SEND", "0") == "1")
     # Allow sending if there are only errors (no signals) when SEND_ON_ERROR=1
@@ -281,6 +291,9 @@ if __name__ == "__main__":
             while True:
                 main()
                 # Avoid spamming if ALWAYS_SEND=1; dedup also protects identical content
+                hb = (_get_env("HEARTBEAT", "1") == "1")
+                if hb:
+                    print(f"[HEARTBEAT] next check in {max(5, interval_s)} sec")
                 time.sleep(max(5, interval_s))
         else:
             # Single run (use OS scheduler for cadence)
