@@ -308,6 +308,15 @@ def _build_entry_signal(ticker: str, df_1m: pd.DataFrame, df_60m: pd.DataFrame) 
     
 
 
+def _fmt_ts(ts: pd.Timestamp) -> str:
+    try:
+        if getattr(ts, 'tzinfo', None) is not None and ts.tzinfo is not None:
+            return ts.strftime('%Y-%m-%d %H:%M %Z')
+        return ts.strftime('%Y-%m-%d %H:%M')
+    except Exception:
+        return str(ts)
+
+
 def build_report(tickers: List[str]) -> Dict[str, List[str]]:
     results: Dict[str, List[str]] = {}
     for t in tickers:
@@ -324,7 +333,7 @@ def build_report(tickers: List[str]) -> Dict[str, List[str]]:
             if sig:
                 stop = sig["entry"] - 2 * sig["atr"] if sig["dir"] == "long" else sig["entry"] + 2 * sig["atr"]
                 bucket.append(
-                    f"[{DEFAULT_BASE_INTERVAL}] entry {sig['dir']} @ {sig['entry']:.2f} | ATR={sig['atr']:.2f} stop={stop:.2f} qty={sig['qty']} (EMA50h={sig['ema50_h']:.2f} slope={sig['ema_slope']:+.2f})"
+                    f"[{DEFAULT_BASE_INTERVAL}] entry {sig['dir']} @ {sig['entry']:.2f} (bar={_fmt_ts(sig['ts'])}) | ATR={sig['atr']:.2f} stop={stop:.2f} qty={sig['qty']} (EMA50h={sig['ema50_h']:.2f} slope={sig['ema_slope']:+.2f})"
                 )
         except Exception as e:
             bucket.append(f"[{DEFAULT_BASE_INTERVAL}] Error: {e}")
