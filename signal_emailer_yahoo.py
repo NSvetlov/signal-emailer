@@ -210,7 +210,8 @@ def main() -> int:
         print(
             f"[HEARTBEAT] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} "
             f"tickers={len(tickers)} alerts={total_alerts} errors={errors_count} "
-            f"yf_interval={_get_env('YF_INTERVAL', '1d') or '1d'}"
+            f"yf_interval={_get_env('YF_INTERVAL', '1d') or '1d'}",
+            flush=True,
         )
 
     # Only send when there are alerts by default; override with ALWAYS_SEND=1
@@ -252,33 +253,34 @@ def main() -> int:
     # Optional debug logging of decision inputs
     debug = (_get_env("DEBUG", "0") == "1")
     if debug:
-        print("[DEBUG] total_alerts=", total_alerts)
-        print("[DEBUG] errors_only=", has_errors_only, "errors_count=", sum(len(v) for v in errors_by_ticker.values()))
-        print("[DEBUG] always_send=", always_send, "send_on_error=", send_on_error)
-        print("[DEBUG] disable_dedup=", disable_dedup, "min_interval_s=", min_interval_s)
+        print("[DEBUG] total_alerts=", total_alerts, flush=True)
+        print("[DEBUG] errors_only=", has_errors_only, "errors_count=", sum(len(v) for v in errors_by_ticker.values()), flush=True)
+        print("[DEBUG] always_send=", always_send, "send_on_error=", send_on_error, flush=True)
+        print("[DEBUG] disable_dedup=", disable_dedup, "min_interval_s=", min_interval_s, flush=True)
     if should_send_now and not disable_dedup:
         if last_hash == content_hash and (now_ts - last_sent) < min_interval_s:
             should_send_now = False
             remaining = max(0, min_interval_s - (now_ts - last_sent))
             print(
-                f"Skipping duplicate email (next allowed in ~{remaining} sec)."
+                f"Skipping duplicate email (next allowed in ~{remaining} sec).",
+                flush=True,
             )
 
     if should_send_now:
         # Dry run mode for safe verification
         dry_run = (_get_env("DRY_RUN", "0") == "1")
         if dry_run:
-            print("[DRY_RUN] Would send email with subject:", subject)
-            print("[DRY_RUN] Body:\n" + body)
+            print("[DRY_RUN] Would send email with subject:", subject, flush=True)
+            print("[DRY_RUN] Body:\n" + body, flush=True)
         else:
             send_email(subject, body)
-            print(f"Email sent: {subject}")
+            print(f"Email sent: {subject}", flush=True)
         # update state
         state.update({"last_hash": content_hash, "last_sent": now_ts})
         _save_state(state_path, state)
     else:
         if total_alerts == 0 and not always_send and not (send_on_error and has_errors_only):
-            print("No alerts; not sending email (set ALWAYS_SEND=1 or SEND_ON_ERROR=1 to force).")
+            print("No alerts; not sending email (set ALWAYS_SEND=1 or SEND_ON_ERROR=1 to force).", flush=True)
 
     return 0
 
@@ -288,12 +290,15 @@ if __name__ == "__main__":
     interval_s = int(_get_env("CHECK_INTERVAL_SECONDS", "60") or "60")
     try:
         if interval_s > 0:
+            hb = (_get_env("HEARTBEAT", "1") == "1")
+            if hb:
+                print(f"[HEARTBEAT] service start; interval={interval_s}s", flush=True)
             while True:
                 main()
                 # Avoid spamming if ALWAYS_SEND=1; dedup also protects identical content
                 hb = (_get_env("HEARTBEAT", "1") == "1")
                 if hb:
-                    print(f"[HEARTBEAT] next check in {max(5, interval_s)} sec")
+                    print(f"[HEARTBEAT] next check in {max(5, interval_s)} sec", flush=True)
                 time.sleep(max(5, interval_s))
         else:
             # Single run (use OS scheduler for cadence)
