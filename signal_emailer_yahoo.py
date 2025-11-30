@@ -229,6 +229,14 @@ def main() -> int:
 
     has_errors_only = (total_alerts == 0 and len(errors_by_ticker) > 0)
     should_send_now = (total_alerts > 0 or always_send or (send_on_error and has_errors_only))
+
+    # Optional debug logging of decision inputs
+    debug = (_get_env("DEBUG", "0") == "1")
+    if debug:
+        print("[DEBUG] total_alerts=", total_alerts)
+        print("[DEBUG] errors_only=", has_errors_only, "errors_count=", sum(len(v) for v in errors_by_ticker.values()))
+        print("[DEBUG] always_send=", always_send, "send_on_error=", send_on_error)
+        print("[DEBUG] disable_dedup=", disable_dedup, "min_interval_s=", min_interval_s)
     if should_send_now and not disable_dedup:
         if last_hash == content_hash and (now_ts - last_sent) < min_interval_s:
             should_send_now = False
@@ -238,8 +246,14 @@ def main() -> int:
             )
 
     if should_send_now:
-        send_email(subject, body)
-        print(f"Email sent: {subject}")
+        # Dry run mode for safe verification
+        dry_run = (_get_env("DRY_RUN", "0") == "1")
+        if dry_run:
+            print("[DRY_RUN] Would send email with subject:", subject)
+            print("[DRY_RUN] Body:\n" + body)
+        else:
+            send_email(subject, body)
+            print(f"Email sent: {subject}")
         # update state
         state.update({"last_hash": content_hash, "last_sent": now_ts})
         _save_state(state_path, state)
