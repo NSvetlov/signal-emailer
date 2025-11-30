@@ -23,6 +23,21 @@ def _get_env(name: str, default: str | None = None, required: bool = False) -> s
         return val.strip()
     return val
 
+# Optional file logging helper. Set LOG_FILE to a path to enable.
+LOG_FILE = os.environ.get("LOG_FILE")
+
+def _log(msg: str) -> None:
+    try:
+        print(msg, flush=True)
+    finally:
+        lf = os.environ.get("LOG_FILE", LOG_FILE)
+        if lf:
+            try:
+                with open(lf, "a", encoding="utf-8") as f:
+                    f.write(msg + "\n")
+            except Exception:
+                pass
+
 
 def send_email(subject: str, body: str) -> None:
     server = _get_env("SMTP_SERVER", "smtp.gmail.com")
@@ -207,11 +222,10 @@ def main() -> int:
     hb = (_get_env("HEARTBEAT", "1") == "1")
     if hb:
         errors_count = sum(len(v) for v in errors_by_ticker.values())
-        print(
+        _log(
             f"[HEARTBEAT] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} "
             f"tickers={len(tickers)} alerts={total_alerts} errors={errors_count} "
-            f"yf_interval={_get_env('YF_INTERVAL', '1d') or '1d'}",
-            flush=True,
+            f"yf_interval={_get_env('YF_INTERVAL', '1d') or '1d'}"
         )
 
     # Only send when there are alerts by default; override with ALWAYS_SEND=1
@@ -253,34 +267,31 @@ def main() -> int:
     # Optional debug logging of decision inputs
     debug = (_get_env("DEBUG", "0") == "1")
     if debug:
-        print("[DEBUG] total_alerts=", total_alerts, flush=True)
-        print("[DEBUG] errors_only=", has_errors_only, "errors_count=", sum(len(v) for v in errors_by_ticker.values()), flush=True)
-        print("[DEBUG] always_send=", always_send, "send_on_error=", send_on_error, flush=True)
-        print("[DEBUG] disable_dedup=", disable_dedup, "min_interval_s=", min_interval_s, flush=True)
+        _log(f"[DEBUG] total_alerts= {total_alerts}")
+        _log(f"[DEBUG] errors_only= {has_errors_only} errors_count= {sum(len(v) for v in errors_by_ticker.values())}")
+        _log(f"[DEBUG] always_send= {always_send} send_on_error= {send_on_error}")
+        _log(f"[DEBUG] disable_dedup= {disable_dedup} min_interval_s= {min_interval_s}")
     if should_send_now and not disable_dedup:
         if last_hash == content_hash and (now_ts - last_sent) < min_interval_s:
             should_send_now = False
             remaining = max(0, min_interval_s - (now_ts - last_sent))
-            print(
-                f"Skipping duplicate email (next allowed in ~{remaining} sec).",
-                flush=True,
-            )
+            _log(f"Skipping duplicate email (next allowed in ~{remaining} sec).")
 
     if should_send_now:
         # Dry run mode for safe verification
         dry_run = (_get_env("DRY_RUN", "0") == "1")
         if dry_run:
-            print("[DRY_RUN] Would send email with subject:", subject, flush=True)
-            print("[DRY_RUN] Body:\n" + body, flush=True)
+            _log(f"[DRY_RUN] Would send email with subject: {subject}")
+            _log("[DRY_RUN] Body:\n" + body)
         else:
             send_email(subject, body)
-            print(f"Email sent: {subject}", flush=True)
+            _log(f"Email sent: {subject}")
         # update state
         state.update({"last_hash": content_hash, "last_sent": now_ts})
         _save_state(state_path, state)
     else:
         if total_alerts == 0 and not always_send and not (send_on_error and has_errors_only):
-            print("No alerts; not sending email (set ALWAYS_SEND=1 or SEND_ON_ERROR=1 to force).", flush=True)
+            _log("No alerts; not sending email (set ALWAYS_SEND=1 or SEND_ON_ERROR=1 to force).")
 
     return 0
 
@@ -292,13 +303,13 @@ if __name__ == "__main__":
         if interval_s > 0:
             hb = (_get_env("HEARTBEAT", "1") == "1")
             if hb:
-                print(f"[HEARTBEAT] service start; interval={interval_s}s", flush=True)
+                _log(f"[HEARTBEAT] service start; interval={interval_s}s")
             while True:
                 main()
                 # Avoid spamming if ALWAYS_SEND=1; dedup also protects identical content
                 hb = (_get_env("HEARTBEAT", "1") == "1")
                 if hb:
-                    print(f"[HEARTBEAT] next check in {max(5, interval_s)} sec", flush=True)
+                    _log(f"[HEARTBEAT] next check in {max(5, interval_s)} sec")
                 time.sleep(max(5, interval_s))
         else:
             # Single run (use OS scheduler for cadence)
